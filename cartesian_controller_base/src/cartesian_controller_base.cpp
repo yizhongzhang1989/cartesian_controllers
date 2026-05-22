@@ -45,6 +45,7 @@
 #include <kdl/jntarray.hpp>
 #include <kdl/tree.hpp>
 #include <kdl_parser/kdl_parser.hpp>
+#include <utility>
 
 #include "controller_interface/controller_interface.hpp"
 #include "controller_interface/helpers.hpp"
@@ -55,7 +56,21 @@
 
 namespace cartesian_controller_base
 {
+// Internal staging slot for the live URDF rebuild pipeline.  Forward declared
+// inside CartesianControllerBase; defined here so that derived controllers do
+// not transitively depend on its layout.  Pre-built on the executor thread,
+// move-assigned into the controller's live members from the RT update path.
+struct CartesianControllerBase::PendingChainSwap
+{
+  std::string robot_description;
+  KDL::Chain robot_chain;
+  std::shared_ptr<IKSolver> ik_solver;
+  std::shared_ptr<KDL::TreeFkSolverPos_recursive> forward_kinematics_solver;
+};
+
 CartesianControllerBase::CartesianControllerBase() {}
+
+CartesianControllerBase::~CartesianControllerBase() = default;
 
 controller_interface::InterfaceConfiguration
 CartesianControllerBase::command_interface_configuration() const
@@ -114,23 +129,11 @@ CartesianControllerBase::on_configure(const rclcpp_lifecycle::State & previous_s
   }
 
   // Load user specified inverse kinematics solver
-  std::string ik_solver = get_node()->get_parameter("ik_solver").as_string();
+  m_ik_solver_plugin_name = get_node()->get_parameter("ik_solver").as_string();
   m_solver_loader.reset(new pluginlib::ClassLoader<IKSolver>(
     "cartesian_controller_base", "cartesian_controller_base::IKSolver"));
-  try
-  {
-    m_ik_solver = m_solver_loader->createSharedInstance(ik_solver);
-  }
-  catch (pluginlib::PluginlibException & ex)
-  {
-    RCLCPP_ERROR(get_node()->get_logger(), ex.what());
-    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
-  }
 
   // Get kinematics specific configuration
-  urdf::Model robot_model;
-  KDL::Tree robot_tree;
-
 #if defined CARTESIAN_CONTROLLERS_JAZZY
   m_robot_description = this->get_robot_description();
 #else
@@ -155,27 +158,6 @@ CartesianControllerBase::on_configure(const rclcpp_lifecycle::State & previous_s
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
 
-  // Build a kinematic chain of the robot
-  if (!robot_model.initString(m_robot_description))
-  {
-    RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse urdf model from 'robot_description'");
-    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
-  }
-  if (!kdl_parser::treeFromUrdfModel(robot_model, robot_tree))
-  {
-    RCLCPP_ERROR(get_node()->get_logger(), "Failed to parse KDL tree from urdf model");
-    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
-  }
-  if (!robot_tree.getChain(m_robot_base_link, m_end_effector_link, m_robot_chain))
-  {
-    const std::string error =
-      ""
-      "Failed to parse robot chain from urdf model. "
-      "Do robot_base_link and end_effector_link exist?";
-    RCLCPP_ERROR(get_node()->get_logger(), error.c_str());
-    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
-  }
-
   // Get names of actuated joints
   m_joint_names = get_node()->get_parameter("joints").as_string_array();
   if (m_joint_names.empty())
@@ -184,35 +166,22 @@ CartesianControllerBase::on_configure(const rclcpp_lifecycle::State & previous_s
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
 
-  // Parse joint limits
-  KDL::JntArray upper_pos_limits(m_joint_names.size());
-  KDL::JntArray lower_pos_limits(m_joint_names.size());
-  for (size_t i = 0; i < m_joint_names.size(); ++i)
+  // Build the kinematic chain and instantiate/initialize the solvers.  The
+  // same helper is reused by the parameter callback that watches
+  // robot_description, so that live URDF updates take effect without an
+  // unload/load cycle.
+  PendingChainSwap initial;
+  std::string build_err;
+  if (!buildKinematics(m_robot_description, m_robot_base_link, m_end_effector_link,
+                       m_joint_names, initial, build_err))
   {
-    if (!robot_model.getJoint(m_joint_names[i]))
-    {
-      RCLCPP_ERROR(get_node()->get_logger(), "Joint %s does not appear in robot_description",
-                   m_joint_names[i].c_str());
-      return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
-    }
-    if (robot_model.getJoint(m_joint_names[i])->type == urdf::Joint::CONTINUOUS)
-    {
-      upper_pos_limits(i) = std::nan("0");
-      lower_pos_limits(i) = std::nan("0");
-    }
-    else
-    {
-      // Non-existent urdf limits are zero initialized
-      upper_pos_limits(i) = robot_model.getJoint(m_joint_names[i])->limits->upper;
-      lower_pos_limits(i) = robot_model.getJoint(m_joint_names[i])->limits->lower;
-    }
+    RCLCPP_ERROR(get_node()->get_logger(), "%s", build_err.c_str());
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
+  m_robot_chain = std::move(initial.robot_chain);
+  m_ik_solver = std::move(initial.ik_solver);
+  m_forward_kinematics_solver = std::move(initial.forward_kinematics_solver);
 
-  // Initialize solvers
-  m_ik_solver->init(get_node(), m_robot_chain, upper_pos_limits, lower_pos_limits);
-  KDL::Tree tmp("not_relevant");
-  tmp.addChain(m_robot_chain, "not_relevant");
-  m_forward_kinematics_solver.reset(new KDL::TreeFkSolverPos_recursive(tmp));
   m_iterations = get_node()->get_parameter("solver.iterations").as_int();
   m_error_scale = get_node()->get_parameter("solver.error_scale").as_double();
 
@@ -250,6 +219,15 @@ CartesianControllerBase::on_configure(const rclcpp_lifecycle::State & previous_s
 
   m_configured = true;
 
+  // Register the parameter callback AFTER the controller has been fully
+  // configured.  This ensures the initial robot_description set (which happens
+  // implicitly during controller load) does not trigger a redundant rebuild,
+  // and that the first time we react to a robot_description update we already
+  // have a valid set of cached members to swap out.
+  m_param_callback_handle = get_node()->add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & params)
+    { return this->onParameterUpdate(params); });
+
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
 }
 
@@ -267,6 +245,210 @@ CartesianControllerBase::on_deactivate(const rclcpp_lifecycle::State & previous_
     m_active = false;
   }
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+}
+
+bool CartesianControllerBase::buildKinematics(const std::string & robot_description,
+                                              const std::string & robot_base_link,
+                                              const std::string & end_effector_link,
+                                              const std::vector<std::string> & joint_names,
+                                              PendingChainSwap & out, std::string & error_msg)
+{
+  if (robot_description.empty())
+  {
+    error_msg = "robot_description is empty";
+    return false;
+  }
+
+  urdf::Model robot_model;
+  if (!robot_model.initString(robot_description))
+  {
+    error_msg = "Failed to parse urdf model from 'robot_description'";
+    return false;
+  }
+
+  KDL::Tree robot_tree;
+  if (!kdl_parser::treeFromUrdfModel(robot_model, robot_tree))
+  {
+    error_msg = "Failed to parse KDL tree from urdf model";
+    return false;
+  }
+
+  KDL::Chain robot_chain;
+  if (!robot_tree.getChain(robot_base_link, end_effector_link, robot_chain))
+  {
+    error_msg = "Failed to parse robot chain from urdf model. Do robot_base_link='" +
+                robot_base_link + "' and end_effector_link='" + end_effector_link + "' exist?";
+    return false;
+  }
+
+  // Parse joint limits.  Joint set is fixed for the controller's lifetime
+  // (changing it would invalidate the hardware-interface bindings claimed at
+  // on_activate), so any mismatch is a hard failure.
+  KDL::JntArray upper_pos_limits(joint_names.size());
+  KDL::JntArray lower_pos_limits(joint_names.size());
+  for (size_t i = 0; i < joint_names.size(); ++i)
+  {
+    const auto joint = robot_model.getJoint(joint_names[i]);
+    if (!joint)
+    {
+      error_msg = "Joint '" + joint_names[i] + "' does not appear in robot_description";
+      return false;
+    }
+    if (joint->type == urdf::Joint::CONTINUOUS)
+    {
+      upper_pos_limits(i) = std::nan("0");
+      lower_pos_limits(i) = std::nan("0");
+    }
+    else
+    {
+      // Non-existent urdf limits are zero initialized
+      upper_pos_limits(i) = joint->limits->upper;
+      lower_pos_limits(i) = joint->limits->lower;
+    }
+  }
+
+  // Instantiate a *fresh* IK solver.  Re-initializing the existing instance
+  // would not be safe vs. the RT update() thread, which may concurrently be
+  // calling getJointControlCmds() on it.  pluginlib's createSharedInstance is
+  // re-entrant for repeated use of the same loader.
+  std::shared_ptr<IKSolver> ik_solver;
+  try
+  {
+    ik_solver = m_solver_loader->createSharedInstance(m_ik_solver_plugin_name);
+  }
+  catch (pluginlib::PluginlibException & ex)
+  {
+    error_msg = std::string("Failed to instantiate IK solver plugin '") +
+                m_ik_solver_plugin_name + "': " + ex.what();
+    return false;
+  }
+  if (!ik_solver->init(get_node(), robot_chain, upper_pos_limits, lower_pos_limits))
+  {
+    error_msg = "IK solver init() failed for plugin '" + m_ik_solver_plugin_name + "'";
+    return false;
+  }
+
+  // Build a TreeFkSolver over a one-chain tree.  This is what the base class
+  // uses for displayInBaseLink() and friends.
+  KDL::Tree tmp("not_relevant");
+  tmp.addChain(robot_chain, "not_relevant");
+  auto fk_solver = std::make_shared<KDL::TreeFkSolverPos_recursive>(tmp);
+
+  out.robot_description = robot_description;
+  out.robot_chain = std::move(robot_chain);
+  out.ik_solver = std::move(ik_solver);
+  out.forward_kinematics_solver = std::move(fk_solver);
+  return true;
+}
+
+rcl_interfaces::msg::SetParametersResult CartesianControllerBase::onParameterUpdate(
+  const std::vector<rclcpp::Parameter> & parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  // We only care about robot_description here; other parameters (solver gains,
+  // hand_frame_control, etc.) flow through unchanged and pass the default
+  // accept.  The callback must, however, return for ALL set requests.
+  for (const auto & param : parameters)
+  {
+    if (param.get_name() != "robot_description")
+    {
+      continue;
+    }
+    if (param.get_type() != rclcpp::ParameterType::PARAMETER_STRING)
+    {
+      result.successful = false;
+      result.reason = "robot_description must be a string";
+      return result;
+    }
+    const std::string new_urdf = param.as_string();
+    if (new_urdf == m_robot_description)
+    {
+      // No-op update relative to the *currently-installed* chain.  We
+      // must, however, drop any previously-staged swap, otherwise a
+      // sequence like push(U1) -> push(U0) (with U0 == current cached)
+      // would leave U1 pending, and the next update() cycle would
+      // resurrect U1 long after the operator intended to revert.
+      if (m_chain_swap_pending.exchange(false, std::memory_order_acq_rel))
+      {
+        std::lock_guard<std::mutex> lock(m_chain_swap_mutex);
+        m_pending_chain_swap.reset();
+        RCLCPP_INFO(get_node()->get_logger(),
+                    "robot_description matches current chain; dropped "
+                    "previously-staged swap");
+      }
+      continue;
+    }
+
+    PendingChainSwap pending;
+    std::string err;
+    if (!buildKinematics(new_urdf, m_robot_base_link, m_end_effector_link, m_joint_names,
+                         pending, err))
+    {
+      result.successful = false;
+      result.reason =
+        "Rejected robot_description update: " + err + " (existing chain kept intact)";
+      RCLCPP_WARN(get_node()->get_logger(), "%s", result.reason.c_str());
+      return result;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(m_chain_swap_mutex);
+      m_pending_chain_swap = std::make_shared<PendingChainSwap>(std::move(pending));
+    }
+    m_chain_swap_pending.store(true, std::memory_order_release);
+    RCLCPP_INFO(get_node()->get_logger(),
+                "Queued kinematic chain rebuild from new robot_description (%zu bytes)",
+                new_urdf.size());
+  }
+
+  return result;
+}
+
+void CartesianControllerBase::synchronizeKinematics()
+{
+  // Fast path: no pending swap.  Acquire-load pairs with the release-store in
+  // onParameterUpdate(), so once we see the flag set we are guaranteed to see
+  // the m_pending_chain_swap write that preceded it.
+  if (!m_chain_swap_pending.load(std::memory_order_acquire))
+  {
+    return;
+  }
+
+  std::shared_ptr<PendingChainSwap> pending;
+  {
+    std::lock_guard<std::mutex> lock(m_chain_swap_mutex);
+    pending = std::move(m_pending_chain_swap);
+  }
+  // Clear the flag *after* we have taken ownership of the staged swap so a
+  // concurrent param update cannot see a stale flag and skip its own publish.
+  m_chain_swap_pending.store(false, std::memory_order_release);
+
+  if (!pending)
+  {
+    return;
+  }
+
+  // Install the new chain + solvers atomically from the RT thread's point of
+  // view: each assignment is a single pointer/value replacement.  The old
+  // shared_ptrs are released here, which means their destructors run on the
+  // RT thread.  KDL solvers and chains have small destructors (deleting a
+  // handful of JntArrays and KDL::Solver objects), so this is acceptable for
+  // a typical 100-500 Hz controller cycle.  If a hard-RT use case ever needs
+  // it, the dropped shared_ptrs can be pushed to a disposal queue drained by
+  // a non-RT thread instead.
+  m_robot_description = std::move(pending->robot_description);
+  m_robot_chain = std::move(pending->robot_chain);
+  m_ik_solver = std::move(pending->ik_solver);
+  m_forward_kinematics_solver = std::move(pending->forward_kinematics_solver);
+
+  // Give derived controllers a chance to refresh anything that depends on the
+  // chain (e.g. cartesian_force_controller's cached FT-sensor transform).
+  onChainRebuilt();
+
+  RCLCPP_INFO(get_node()->get_logger(),
+              "Kinematic chain swapped in from updated robot_description");
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn

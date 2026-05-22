@@ -45,6 +45,7 @@
 #include <cartesian_controller_base/Utility.h>
 #include <realtime_tools/realtime_publisher.h>
 
+#include <atomic>
 #include <controller_interface/controller_interface.hpp>
 #include <functional>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -54,7 +55,9 @@
 #include <hardware_interface/loaned_state_interface.hpp>
 #include <kdl/treefksolverpos_recursive.hpp>
 #include <memory>
+#include <mutex>
 #include <pluginlib/class_loader.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
@@ -79,7 +82,7 @@ class CartesianControllerBase : public controller_interface::ControllerInterface
 {
 public:
   CartesianControllerBase();
-  virtual ~CartesianControllerBase(){};
+  virtual ~CartesianControllerBase();
 
   virtual controller_interface::InterfaceConfiguration command_interface_configuration()
     const override;
@@ -178,6 +181,28 @@ protected:
    */
   bool isActive() const { return m_active; };
 
+  /**
+   * @brief Apply any pending kinematic-chain swap before each control cycle.
+   *
+   * Derived controllers MUST call this at the very top of their update()
+   * method, before any access to m_ik_solver, m_forward_kinematics_solver, or
+   * m_robot_chain.  It is RT-safe: when no swap is pending it is a single
+   * acquire-load of an atomic flag; when a swap is pending it briefly takes a
+   * mutex (uncontended) and move-assigns shared_ptrs.  See the param callback
+   * registered in on_configure() for how new chains are queued.
+   */
+  void synchronizeKinematics();
+
+  /**
+   * @brief Hook called from the RT thread right after a successful chain swap.
+   *
+   * Derived classes that cache anything derived from the KDL chain (for
+   * example, the cartesian_force_controller's m_ft_sensor_transform) should
+   * override this to refresh that state.  The default implementation does
+   * nothing.
+   */
+  virtual void onChainRebuilt() {}
+
   KDL::Chain m_robot_chain;
 
   std::shared_ptr<KDL::TreeFkSolverPos_recursive> m_forward_kinematics_solver;
@@ -196,7 +221,58 @@ protected:
   std::vector<std::reference_wrapper<hardware_interface::LoanedStateInterface>>
     m_joint_state_pos_handles;
 
+  // Names of the actuated joints, kept for live URDF rebuilds.
+  std::vector<std::string> m_joint_names;
+
 private:
+  // Forward declaration of the staging slot used by the live URDF rebuild
+  // pipeline.  Defined in the .cpp file because the helper logic does not need
+  // to be visible to derived controllers.
+  struct PendingChainSwap;
+
+  /**
+   * @brief Build a complete KDL chain + IK/FK solvers from a URDF string.
+   *
+   * Pure function over the inputs: does not touch any member except the IK
+   * plugin loader (which is internally thread-safe in pluginlib).  Used both
+   * by on_configure() and by the parameter callback that watches
+   * robot_description.
+   *
+   * @param[in]  robot_description  Full URDF/xacro-expanded XML string
+   * @param[in]  robot_base_link    Chain root (must exist in the URDF)
+   * @param[in]  end_effector_link  Chain tip (must exist in the URDF)
+   * @param[in]  joint_names        Actuated joint names (must all exist in URDF)
+   * @param[out] out                Pre-built chain + solvers on success
+   * @param[out] error_msg          Human-readable diagnostic on failure
+   * @return true on success, false otherwise (out is unspecified on failure)
+   */
+  bool buildKinematics(const std::string & robot_description,
+                       const std::string & robot_base_link,
+                       const std::string & end_effector_link,
+                       const std::vector<std::string> & joint_names,
+                       PendingChainSwap & out, std::string & error_msg);
+
+  /**
+   * @brief Parameter callback that watches `robot_description`.
+   *
+   * Runs on the executor (non-RT) thread.  On a successful URDF parse, queues
+   * a chain swap that the RT thread will pick up in synchronizeKinematics().
+   * Rejects (returns successful=false) on parse failure, missing chain, or
+   * missing actuated joints.
+   */
+  rcl_interfaces::msg::SetParametersResult onParameterUpdate(
+    const std::vector<rclcpp::Parameter> & parameters);
+
+  // Live-rebuild plumbing.  m_pending_chain_swap is guarded by
+  // m_chain_swap_mutex; m_chain_swap_pending is the RT-side hint that there
+  // is something to swap.  m_ik_solver_plugin_name caches the pluginlib name
+  // so the param callback can instantiate fresh IKSolver objects.
+  std::string m_ik_solver_plugin_name;
+  std::atomic<bool> m_chain_swap_pending{false};
+  std::mutex m_chain_swap_mutex;
+  std::shared_ptr<PendingChainSwap> m_pending_chain_swap;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr m_param_callback_handle;
+
   /**
      * @brief Stop joint motion when in velocity control
      */
@@ -230,7 +306,6 @@ private:
   std::vector<std::reference_wrapper<hardware_interface::LoanedCommandInterface>>
     m_joint_cmd_vel_handles;
 
-  std::vector<std::string> m_joint_names;
   trajectory_msgs::msg::JointTrajectoryPoint m_simulated_joint_motion;
   SpatialPDController m_spatial_controller;
   ctrl::Vector6D m_cartesian_input;

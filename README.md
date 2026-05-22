@@ -83,3 +83,22 @@ If you are interested in more details, have a look at
 
 Here's an application of imitation learning for force-controlled assembly on a UR10e
 - *Learning Human-Inspired Force Strategies for Robotic Assembly* ([Paper](https://arxiv.org/abs/2303.12440))
+
+## Change log (fork)
+
+This repository is a fork of
+[fzi-forschungszentrum-informatik/cartesian_controllers](https://github.com/fzi-forschungszentrum-informatik/cartesian_controllers).
+Per-change records live under [`changelog/`](changelog/README.md), one file
+per change, named `YYYY-MM-DD-<slug>.md`. The high-level summary of what
+this fork adds on top of upstream is:
+
+- **Live `robot_description` updates**
+  ([2026-05-21](changelog/2026-05-21-live-robot-description-updates.md)) —
+  the base controller now subscribes to parameter updates of
+  `robot_description` and rebuilds its KDL chain, IK solver and FK solver
+  at runtime, with no controller unload/reload required. The expensive
+  build runs on the executor thread and is swapped into the RT thread via
+  an `std::atomic<bool>` flag and a brief mutex hand-off. A virtual
+  `onChainRebuilt()` hook lets derived controllers refresh chain-dependent
+  state (e.g. the FT-sensor reference frame in
+  `cartesian_force_controller`).

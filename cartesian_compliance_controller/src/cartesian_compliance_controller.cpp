@@ -132,6 +132,9 @@ CartesianComplianceController::on_deactivate(const rclcpp_lifecycle::State & pre
 controller_interface::return_type CartesianComplianceController::update(
   const rclcpp::Time & time, const rclcpp::Duration & period)
 {
+  // Apply any pending kinematic-chain swap before touching the IK/FK solvers.
+  Base::synchronizeKinematics();
+
   // Synchronize the internal model and the real robot
   Base::m_ik_solver->synchronizeJointPositions(Base::m_joint_state_pos_handles);
 

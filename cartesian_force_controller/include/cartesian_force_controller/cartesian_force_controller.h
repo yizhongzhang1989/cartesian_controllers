@@ -102,6 +102,17 @@ protected:
   std::string m_new_ft_sensor_ref;
   void setFtSensorReferenceFrame(const std::string & new_ref);
 
+  /**
+   * @brief Refresh state derived from the KDL chain after a live URDF rebuild.
+   *
+   * The base class swaps in a new chain + FK solver atomically.  We then need
+   * to recompute the static FT->reference transform from the new geometry,
+   * and to verify that ft_sensor_ref_link still belongs to the new chain.
+   * Called from the RT thread; safe because all work is local pointer reads
+   * and KDL FK on the already-installed new solvers.
+   */
+  void onChainRebuilt() override;
+
 private:
   void targetWrenchCallback(const geometry_msgs::msg::WrenchStamped::SharedPtr wrench);
   void ftSensorWrenchCallback(const geometry_msgs::msg::WrenchStamped::SharedPtr wrench);
