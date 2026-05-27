@@ -82,4 +82,9 @@ double PDController::operator()(const double & error, const rclcpp::Duration & p
   return result;
 }
 
+void PDController::reset()
+{
+  m_last_p_error = 0.0;
+}
+
 }  // namespace cartesian_controller_base

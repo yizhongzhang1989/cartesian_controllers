@@ -77,4 +77,12 @@ bool SpatialPDController::init(std::shared_ptr<rclcpp_lifecycle::LifecycleNode> 
   return true;
 }
 
+void SpatialPDController::reset()
+{
+  for (auto & pd : m_pd_controllers)
+  {
+    pd.reset();
+  }
+}
+
 }  // namespace cartesian_controller_base

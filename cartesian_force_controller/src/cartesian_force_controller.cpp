@@ -121,6 +121,9 @@ CartesianForceController::on_deactivate(const rclcpp_lifecycle::State & previous
 controller_interface::return_type CartesianForceController::update(const rclcpp::Time & time,
                                                                    const rclcpp::Duration & period)
 {
+  // Apply any pending kinematic-chain swap before touching the IK/FK solvers.
+  Base::synchronizeKinematics();
+
   // Synchronize the internal model and the real robot
   Base::m_ik_solver->synchronizeJointPositions(Base::m_joint_state_pos_handles);
 
@@ -176,6 +179,36 @@ void CartesianForceController::setFtSensorReferenceFrame(const std::string & new
   Base::m_forward_kinematics_solver->JntToCart(jnts, new_sensor_ref, m_new_ft_sensor_ref);
 
   m_ft_sensor_transform = new_sensor_ref.Inverse() * sensor_ref;
+}
+
+void CartesianForceController::onChainRebuilt()
+{
+  // The base class has already installed the new chain and FK solver.  We
+  // need to (a) sanity-check that ft_sensor_ref_link is still part of the
+  // chain and (b) recompute the cached static transform from the FT sensor
+  // frame to whichever frame we report wrenches in (end_effector_link for the
+  // pure force controller, compliance_ref_link for the compliance controller;
+  // both are tracked in m_new_ft_sensor_ref).
+  if (!Base::robotChainContains(m_ft_sensor_ref_link))
+  {
+    RCLCPP_ERROR_STREAM(
+      get_node()->get_logger(),
+      "After URDF rebuild: ft_sensor_ref_link='"
+        << m_ft_sensor_ref_link << "' is no longer part of the kinematic chain from "
+        << Base::m_robot_base_link << " to " << Base::m_end_effector_link
+        << "; FT sensor transform will be incorrect until a valid URDF is published");
+    return;
+  }
+  if (!m_new_ft_sensor_ref.empty() && !Base::robotChainContains(m_new_ft_sensor_ref))
+  {
+    RCLCPP_ERROR_STREAM(
+      get_node()->get_logger(),
+      "After URDF rebuild: cached reference frame '"
+        << m_new_ft_sensor_ref << "' is no longer part of the kinematic chain");
+    return;
+  }
+  setFtSensorReferenceFrame(m_new_ft_sensor_ref.empty() ? Base::m_end_effector_link
+                                                        : m_new_ft_sensor_ref);
 }
 
 void CartesianForceController::targetWrenchCallback(

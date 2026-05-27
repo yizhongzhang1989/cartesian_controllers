@@ -102,14 +102,24 @@ CartesianMotionController::on_deactivate(const rclcpp_lifecycle::State & previou
 controller_interface::return_type CartesianMotionController::update(const rclcpp::Time & time,
                                                                     const rclcpp::Duration & period)
 {
+  // Apply any pending kinematic-chain swap before touching the IK/FK solvers.
+  Base::synchronizeKinematics();
+
   // Synchronize the internal model and the real robot
   Base::m_ik_solver->synchronizeJointPositions(Base::m_joint_state_pos_handles);
+
+  // Re-read solver.iterations live so the parameter is tunable without
+  // a controller reload. Same pattern as m_error_scale (read every cycle
+  // inside computeJointControlCmds), so that operators can sweep iters
+  // + pd_gains together for tracking-speed vs. damping tradeoffs.
+  const int iterations = std::max(
+    1, static_cast<int>(get_node()->get_parameter("solver.iterations").as_int()));
 
   // Forward Dynamics turns the search for the according joint motion into a
   // control process. So, we control the internal model until we meet the
   // Cartesian target motion. This internal control needs some simulation time
   // steps.
-  for (int i = 0; i < Base::m_iterations; ++i)
+  for (int i = 0; i < iterations; ++i)
   {
     // The internal 'simulation time' is deliberately independent of the outer
     // control cycle.
