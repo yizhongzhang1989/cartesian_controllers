@@ -494,6 +494,15 @@ CartesianControllerBase::on_activate(const rclcpp_lifecycle::State & previous_st
   };
   m_ik_solver->updateKinematics();
 
+  // Clear any cached per-axis last-error in the spatial PD so the first
+  // real control cycle after (re)activation cannot synthesize a spurious
+  // D-term kick from a stale error sample (e.g. an FT bias measured
+  // during the previous engagement, or zero on the very first activation
+  // when the error vector is suddenly non-zero).  Without this, with
+  // D>0 the discrete (error - m_last_p_error) / dt produces a one-shot
+  // command pulse of magnitude  D * |error_now| / dt  on cycle #1.
+  m_spatial_controller.reset();
+
   // Provide safe command buffers with starting where we are
   computeJointControlCmds(ctrl::Vector6D::Zero(), rclcpp::Duration::from_seconds(0));
   writeJointControlCmds();

@@ -70,6 +70,12 @@ public:
      */
   ctrl::Vector6D operator()(const ctrl::Vector6D & error, const rclcpp::Duration & period);
 
+  //! Clear the per-axis last-error state (forwarded to each PDController).
+  //! Called from CartesianControllerBase::on_activate so the first D-term
+  //! sample after (re)activation cannot amplify a stale error into a
+  //! spurious kick on cycle #1.
+  void reset();
+
 private:
   ctrl::Vector6D m_cmd;
   std::vector<PDController> m_pd_controllers;

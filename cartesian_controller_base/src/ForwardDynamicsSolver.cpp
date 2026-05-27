@@ -88,12 +88,27 @@ trajectory_msgs::msg::JointTrajectoryPoint ForwardDynamicsSolver::getJointContro
   m_current_accelerations.data =
     m_jnt_space_inertia.data.inverse() * m_jnt_jacobian.data.transpose() * net_force;
 
-  // Numerical time integration with the Euler forward method
-  m_current_positions.data = m_last_positions.data + m_last_velocities.data * period.seconds();
+  // Symplectic (semi-implicit) Euler time integration.
+  //
+  // Update the velocity first (with the per-cycle 10 % global damping
+  // against unwanted null-space motion; will cause exponential slow-down
+  // without input), then propagate the position using that updated
+  // velocity.  Compared with the textbook explicit Euler scheme used
+  // upstream (q_new = q + v_old * dt, v_new = v_old + a * dt) this is
+  // numerically stable for much higher Cartesian stiffness without
+  // changing the steady-state behaviour: when the system has settled
+  // (a == 0) both schemes give the same v_new = 0.9 * v_old, and any
+  // bounded a produces the same first-order accuracy.  The benefit is
+  // that the position update can no longer overshoot a high-frequency
+  // mode that has just been reversed by a large a*dt, which is the
+  // classic explicit-Euler instability when error_scale * P * K * dt^2
+  // (stiffness loop) approaches unity.  See
+  // https://en.wikipedia.org/wiki/Semi-implicit_Euler_method
   m_current_velocities.data =
     m_last_velocities.data + m_current_accelerations.data * period.seconds();
-  m_current_velocities.data *= 0.9;  // 10 % global damping against unwanted null space motion.
-                                     // Will cause exponential slow-down without input.
+  m_current_velocities.data *= 0.9;
+  m_current_positions.data = m_last_positions.data + m_current_velocities.data * period.seconds();
+
   // Make sure positions stay in allowed margins
   applyJointLimits();
 

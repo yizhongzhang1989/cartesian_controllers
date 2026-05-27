@@ -66,6 +66,10 @@ public:
 
   double operator()(const double & error, const rclcpp::Duration & period);
 
+  //! Clear last-error state so the first D-term sample after (re)activation
+  //! does not amplify a stale error into a spurious kick on cycle #1.
+  void reset();
+
 private:
   std::shared_ptr<rclcpp_lifecycle::LifecycleNode> m_handle;
   std::string m_params;  ///< namespace for parameter access
