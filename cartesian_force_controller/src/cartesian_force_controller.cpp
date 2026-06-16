@@ -77,7 +77,11 @@ CartesianForceController::on_configure(const rclcpp_lifecycle::State & previous_
 
   // Make sure sensor link is part of the robot chain
   m_ft_sensor_ref_link = get_node()->get_parameter("ft_sensor_ref_link").as_string();
-  if (!Base::robotChainContains(m_ft_sensor_ref_link))
+  // In urdf_from_topic mode the chain is built asynchronously (after this
+  // callback returns), so defer the in-chain validation to onChainRebuilt(),
+  // which the topic callback invokes once the URDF is installed.  Validate now
+  // only when the chain already exists (stock parameter mode).
+  if (Base::chainBuilt() && !Base::robotChainContains(m_ft_sensor_ref_link))
   {
     RCLCPP_ERROR_STREAM(get_node()->get_logger(), m_ft_sensor_ref_link
                                                     << " is not part of the kinematic chain from "
@@ -86,7 +90,8 @@ CartesianForceController::on_configure(const rclcpp_lifecycle::State & previous_
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
 
-  // Make sure sensor wrenches are interpreted correctly
+  // Make sure sensor wrenches are interpreted correctly (null-safe: in topic
+  // mode this just stashes the reference name until onChainRebuilt()).
   setFtSensorReferenceFrame(Base::m_end_effector_link);
 
   m_target_wrench_subscriber = get_node()->create_subscription<geometry_msgs::msg::WrenchStamped>(
@@ -167,6 +172,16 @@ void CartesianForceController::setFtSensorReferenceFrame(const std::string & new
   // Compute static transform from the force torque sensor to the new reference
   // frame of interest.
   m_new_ft_sensor_ref = new_ref;
+
+  // In urdf_from_topic mode the chain (and therefore the solvers) is not built
+  // until the first URDF arrives on the topic, which happens *after*
+  // on_configure() returns.  Stash the reference name now and let
+  // onChainRebuilt() recompute the cached transform once the chain is
+  // installed -- calling JntToCart() here would dereference null solvers.
+  if (!Base::m_ik_solver || !Base::m_forward_kinematics_solver)
+  {
+    return;
+  }
 
   // Joint positions should cancel out, i.e. it doesn't matter as long as they
   // are the same for both transformations.

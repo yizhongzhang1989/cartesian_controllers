@@ -176,6 +176,20 @@ protected:
   }
 
   /**
+   * @brief Whether a kinematic chain has been built yet.
+   *
+   * In urdf_from_topic mode the chain build is deferred until the first URDF
+   * arrives on the topic (after on_configure() returns), so this is false
+   * during on_configure().  Derived controllers use it to defer chain-
+   * dependent validation (e.g. checking ft_sensor_ref_link / compliance_ref_
+   * link is in the chain) from on_configure() to onChainRebuilt(), which the
+   * topic callback invokes once the chain is installed.
+   *
+   * @return True once a kinematic chain + solvers are installed.
+   */
+  bool chainBuilt() const { return m_chain_built.load(); }
+
+  /**
    * @brief Helper method to check the controller's state during input callbacks
    *
    * @return True if the controller is active, false otherwise

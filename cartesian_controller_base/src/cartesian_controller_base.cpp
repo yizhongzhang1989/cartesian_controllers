@@ -45,6 +45,7 @@
 #include <kdl/jntarray.hpp>
 #include <kdl/tree.hpp>
 #include <kdl_parser/kdl_parser.hpp>
+#include <mutex>
 #include <std_msgs/msg/string.hpp>
 #include <utility>
 
@@ -291,6 +292,21 @@ bool CartesianControllerBase::buildKinematics(const std::string & robot_descript
                                               const std::vector<std::string> & joint_names,
                                               PendingChainSwap & out, std::string & error_msg)
 {
+  // Serialize chain construction across ALL controllers in this process.
+  //
+  // urdf::Model::initString() loads URDF parser plugins through pluginlib,
+  // whose ClassLoader is NOT thread-safe.  In urdf_from_topic mode every
+  // Cartesian controller subscribes to the same latched canonical URDF, so
+  // their topic callbacks fire buildKinematics() concurrently on the
+  // controller_manager's multi-threaded executor.  Unserialized, the parallel
+  // initString() calls race and some spuriously fail ("Failed to parse urdf
+  // model"), leaving those controllers with no kinematic chain.  A function-
+  // local static mutex is shared by every instance, so it serializes parsing
+  // process-wide.  This runs off the RT path (on_configure / occasional live
+  // URDF updates), so the brief lock is negligible.
+  static std::mutex s_build_mutex;
+  std::lock_guard<std::mutex> build_lock(s_build_mutex);
+
   if (robot_description.empty())
   {
     error_msg = "robot_description is empty";

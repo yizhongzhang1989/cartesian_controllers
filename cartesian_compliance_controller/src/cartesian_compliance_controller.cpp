@@ -88,7 +88,13 @@ CartesianComplianceController::on_configure(const rclcpp_lifecycle::State & prev
 
   // Make sure compliance link is part of the robot chain
   m_compliance_ref_link = get_node()->get_parameter("compliance_ref_link").as_string();
-  if (!Base::robotChainContains(m_compliance_ref_link))
+  // In urdf_from_topic mode the chain is built after on_configure() returns;
+  // defer the in-chain validation to onChainRebuilt() (inherited from the force
+  // controller -- it re-validates ft_sensor_ref_link AND m_new_ft_sensor_ref,
+  // which setFtSensorReferenceFrame() below sets to compliance_ref_link, and
+  // recomputes the transform once the chain is installed).  Validate inline
+  // only in stock parameter mode.
+  if (Base::chainBuilt() && !Base::robotChainContains(m_compliance_ref_link))
   {
     RCLCPP_ERROR_STREAM(get_node()->get_logger(), m_compliance_ref_link
                                                     << " is not part of the kinematic chain from "
@@ -97,7 +103,8 @@ CartesianComplianceController::on_configure(const rclcpp_lifecycle::State & prev
     return TYPE::ERROR;
   }
 
-  // Make sure sensor wrenches are interpreted correctly
+  // Make sure sensor wrenches are interpreted correctly (null-safe: in topic
+  // mode this just stashes compliance_ref_link until onChainRebuilt()).
   ForceBase::setFtSensorReferenceFrame(m_compliance_ref_link);
 
   return TYPE::SUCCESS;
