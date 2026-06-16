@@ -45,6 +45,7 @@
 #include <kdl/jntarray.hpp>
 #include <kdl/tree.hpp>
 #include <kdl_parser/kdl_parser.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <utility>
 
 #include "controller_interface/controller_interface.hpp"
@@ -115,6 +116,11 @@ CartesianControllerBase::on_init()
     auto_declare<double>("solver.error_scale", 1.0);
     auto_declare<int>("solver.iterations", 1);
     auto_declare<bool>("solver.publish_state_feedback", false);
+    // Topic-sourced URDF (single source of truth).  Default false keeps the
+    // stock behaviour (read the robot_description parameter once).  When true,
+    // the controller subscribes to robot_description_topic and uses ONLY that.
+    auto_declare<bool>("urdf_from_topic", false);
+    auto_declare<std::string>("robot_description_topic", "/cartesian/robot_description");
     m_initialized = true;
   }
   return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -133,18 +139,17 @@ CartesianControllerBase::on_configure(const rclcpp_lifecycle::State & previous_s
   m_solver_loader.reset(new pluginlib::ClassLoader<IKSolver>(
     "cartesian_controller_base", "cartesian_controller_base::IKSolver"));
 
-  // Get kinematics specific configuration
-#if defined CARTESIAN_CONTROLLERS_JAZZY
-  m_robot_description = this->get_robot_description();
-#else
-  m_robot_description = get_node()->get_parameter("robot_description").as_string();
-#endif
+  // URDF source selection.  Default (stock): read the robot_description
+  // parameter once.  When urdf_from_topic=true the controller instead reads its
+  // URDF EXCLUSIVELY from a latched robot_description topic (single source of
+  // truth), deferring the kinematic-chain build until the first URDF arrives.
+  m_urdf_from_topic = get_node()->get_parameter("urdf_from_topic").as_bool();
+  m_robot_description_topic =
+    get_node()->get_parameter("robot_description_topic").as_string();
 
-  if (m_robot_description.empty())
-  {
-    RCLCPP_ERROR(get_node()->get_logger(), "robot_description is empty");
-    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
-  }
+  // Static configuration needed regardless of the URDF source (these define the
+  // claimed hardware interfaces and the chain endpoints; they do NOT change on a
+  // live URDF update).
   m_robot_base_link = get_node()->get_parameter("robot_base_link").as_string();
   if (m_robot_base_link.empty())
   {
@@ -166,21 +171,54 @@ CartesianControllerBase::on_configure(const rclcpp_lifecycle::State & previous_s
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
 
-  // Build the kinematic chain and instantiate/initialize the solvers.  The
-  // same helper is reused by the parameter callback that watches
-  // robot_description, so that live URDF updates take effect without an
-  // unload/load cycle.
-  PendingChainSwap initial;
-  std::string build_err;
-  if (!buildKinematics(m_robot_description, m_robot_base_link, m_end_effector_link,
-                       m_joint_names, initial, build_err))
+  if (m_urdf_from_topic)
   {
-    RCLCPP_ERROR(get_node()->get_logger(), "%s", build_err.c_str());
-    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
+    // Defer the chain build: subscribe to the canonical URDF (latched) and let
+    // robotDescriptionTopicCallback() build the chain on the first message.
+    // on_activate is gated on m_chain_built.
+    rclcpp::QoS qos(1);
+    qos.transient_local().reliable().keep_last(1);
+    m_robot_description_sub = get_node()->create_subscription<std_msgs::msg::String>(
+      m_robot_description_topic, qos,
+      std::bind(&CartesianControllerBase::robotDescriptionTopicCallback, this,
+                std::placeholders::_1));
+    m_chain_built.store(false);
+    RCLCPP_INFO(get_node()->get_logger(),
+                "urdf_from_topic=true: deferring kinematics until a URDF is "
+                "received on '%s' (single source of truth)",
+                m_robot_description_topic.c_str());
   }
-  m_robot_chain = std::move(initial.robot_chain);
-  m_ik_solver = std::move(initial.ik_solver);
-  m_forward_kinematics_solver = std::move(initial.forward_kinematics_solver);
+  else
+  {
+    // Stock path: read the robot_description parameter once and build now.
+#if defined CARTESIAN_CONTROLLERS_JAZZY
+    m_robot_description = this->get_robot_description();
+#else
+    m_robot_description = get_node()->get_parameter("robot_description").as_string();
+#endif
+    if (m_robot_description.empty())
+    {
+      RCLCPP_ERROR(get_node()->get_logger(), "robot_description is empty");
+      return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
+    }
+
+    // Build the kinematic chain and instantiate/initialize the solvers.  The
+    // same helper is reused by the parameter/topic callbacks that watch
+    // robot_description, so that live URDF updates take effect without an
+    // unload/load cycle.
+    PendingChainSwap initial;
+    std::string build_err;
+    if (!buildKinematics(m_robot_description, m_robot_base_link, m_end_effector_link,
+                         m_joint_names, initial, build_err))
+    {
+      RCLCPP_ERROR(get_node()->get_logger(), "%s", build_err.c_str());
+      return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
+    }
+    m_robot_chain = std::move(initial.robot_chain);
+    m_ik_solver = std::move(initial.ik_solver);
+    m_forward_kinematics_solver = std::move(initial.forward_kinematics_solver);
+    m_chain_built.store(true);
+  }
 
   m_iterations = get_node()->get_parameter("solver.iterations").as_int();
   m_error_scale = get_node()->get_parameter("solver.error_scale").as_double();
@@ -356,6 +394,12 @@ rcl_interfaces::msg::SetParametersResult CartesianControllerBase::onParameterUpd
     {
       continue;
     }
+    if (m_urdf_from_topic)
+    {
+      // The latched robot_description topic is the single source of truth;
+      // ignore any parameter-based URDF so the two cannot diverge.
+      continue;
+    }
     if (param.get_type() != rclcpp::ParameterType::PARAMETER_STRING)
     {
       result.successful = false;
@@ -404,6 +448,61 @@ rcl_interfaces::msg::SetParametersResult CartesianControllerBase::onParameterUpd
   }
 
   return result;
+}
+
+void CartesianControllerBase::robotDescriptionTopicCallback(const std_msgs::msg::String & msg)
+{
+  if (msg.data.empty())
+  {
+    RCLCPP_WARN(get_node()->get_logger(),
+                "Ignoring empty robot_description on '%s'",
+                m_robot_description_topic.c_str());
+    return;
+  }
+  if (msg.data == m_robot_description)
+  {
+    return;  // no-op relative to the currently-installed chain
+  }
+
+  PendingChainSwap pending;
+  std::string err;
+  if (!buildKinematics(msg.data, m_robot_base_link, m_end_effector_link, m_joint_names,
+                       pending, err))
+  {
+    RCLCPP_WARN(get_node()->get_logger(),
+                "Rejected robot_description from topic '%s': %s (existing chain kept)",
+                m_robot_description_topic.c_str(), err.c_str());
+    return;
+  }
+
+  // Before activation the RT update() loop is not running, so it is safe to
+  // install the new chain directly -- this makes m_ik_solver valid in time for
+  // on_activate().  While active, stage it for the RT thread instead (the same
+  // path onParameterUpdate uses), so synchronizeKinematics() swaps it in.
+  if (!m_active)
+  {
+    m_robot_description = std::move(pending.robot_description);
+    m_robot_chain = std::move(pending.robot_chain);
+    m_ik_solver = std::move(pending.ik_solver);
+    m_forward_kinematics_solver = std::move(pending.forward_kinematics_solver);
+    const bool first = !m_chain_built.exchange(true);
+    onChainRebuilt();
+    RCLCPP_INFO(get_node()->get_logger(),
+                "Installed kinematic chain from topic URDF (%zu bytes)%s",
+                m_robot_description.size(), first ? " [first]" : "");
+  }
+  else
+  {
+    {
+      std::lock_guard<std::mutex> lock(m_chain_swap_mutex);
+      m_pending_chain_swap = std::make_shared<PendingChainSwap>(std::move(pending));
+    }
+    m_chain_swap_pending.store(true, std::memory_order_release);
+    m_chain_built.store(true);
+    RCLCPP_INFO(get_node()->get_logger(),
+                "Queued kinematic chain rebuild from topic URDF (%zu bytes)",
+                msg.data.size());
+  }
 }
 
 void CartesianControllerBase::synchronizeKinematics()
@@ -457,6 +556,21 @@ CartesianControllerBase::on_activate(const rclcpp_lifecycle::State & previous_st
   if (m_active)
   {
     return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+  }
+
+  // With a topic-sourced URDF the first message may have arrived as a staged
+  // swap; install it now.  Then require a valid chain before activating so we
+  // never dereference a null solver (gated activation, single source of truth).
+  synchronizeKinematics();
+  if (!m_chain_built.load() || !m_ik_solver)
+  {
+    const std::string where =
+      m_urdf_from_topic ? (" on '" + m_robot_description_topic + "'") : std::string();
+    RCLCPP_ERROR(get_node()->get_logger(),
+                 "Cannot activate: no robot_description received yet%s. Is the "
+                 "canonical URDF being published (aux_frame_manager)?",
+                 where.c_str());
+    return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::ERROR;
   }
 
   // Get command handles.

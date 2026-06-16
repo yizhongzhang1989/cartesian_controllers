@@ -102,3 +102,13 @@ this fork adds on top of upstream is:
   `onChainRebuilt()` hook lets derived controllers refresh chain-dependent
   state (e.g. the FT-sensor reference frame in
   `cartesian_force_controller`).
+
+- **Topic-sourced `robot_description`**
+  ([2026-06-16](changelog/2026-06-16-topic-sourced-robot-description.md)) —
+  opt-in (`urdf_from_topic:=true`) single source of truth: the controller
+  reads its URDF exclusively from a latched `robot_description` topic
+  (default `/cartesian/robot_description`), deferring the chain build until
+  the URDF arrives and gating activation on it. This decouples the FZI
+  controllers from the controller_manager's immutable URDF, so auxiliary
+  frames can be added by the `aux_frame_manager` (sole writer) without a
+  custom bringup. Default false preserves stock behaviour.

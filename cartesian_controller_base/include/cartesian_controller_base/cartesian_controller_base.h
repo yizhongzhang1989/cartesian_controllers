@@ -59,6 +59,7 @@
 #include <pluginlib/class_loader.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <string>
 #include <trajectory_msgs/msg/joint_trajectory_point.hpp>
 #include <vector>
@@ -263,6 +264,16 @@ private:
   rcl_interfaces::msg::SetParametersResult onParameterUpdate(
     const std::vector<rclcpp::Parameter> & parameters);
 
+  /**
+   * @brief Latched-topic callback that watches the canonical `robot_description`.
+   *
+   * Active only when `urdf_from_topic` is true: the controller reads its URDF
+   * exclusively from this topic (single source of truth). Builds a new chain
+   * and either installs it directly (before activation) or stages it for the
+   * RT thread (while active), mirroring onParameterUpdate().
+   */
+  void robotDescriptionTopicCallback(const std_msgs::msg::String & msg);
+
   // Live-rebuild plumbing.  m_pending_chain_swap is guarded by
   // m_chain_swap_mutex; m_chain_swap_pending is the RT-side hint that there
   // is something to swap.  m_ik_solver_plugin_name caches the pluginlib name
@@ -272,6 +283,14 @@ private:
   std::mutex m_chain_swap_mutex;
   std::shared_ptr<PendingChainSwap> m_pending_chain_swap;
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr m_param_callback_handle;
+
+  // Topic-sourced URDF (single source of truth).  When m_urdf_from_topic is
+  // true the chain build is deferred until the first message on
+  // m_robot_description_topic arrives; m_chain_built gates on_activate.
+  bool m_urdf_from_topic = {false};
+  std::string m_robot_description_topic;
+  std::atomic<bool> m_chain_built{false};
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr m_robot_description_sub;
 
   /**
      * @brief Stop joint motion when in velocity control
