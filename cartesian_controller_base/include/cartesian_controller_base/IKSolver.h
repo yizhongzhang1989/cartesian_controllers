@@ -170,6 +170,52 @@ protected:
      */
   void applyJointLimits();
 
+  /**
+     * @brief Declare the shared null-space redundancy-resolution parameters
+     *
+     * Declares the ``solver.nullspace.*`` parameters (enabled, stiffness,
+     * damping, pinv_lambda, rest_posture, joint_weights).  Derived solvers that
+     * support the null-space term call this once from their ``init()``.  All
+     * default to a disabled, no-op configuration so stock behaviour is
+     * unchanged unless explicitly enabled.
+     */
+  void declareNullspaceParams();
+
+  /**
+     * @brief Refresh the cached null-space parameters from the parameter server
+     *
+     * Call once per ``getJointControlCmds()`` so the gains remain live-tunable
+     * (same pattern as the forward-dynamics ``link_mass`` / DLS ``alpha``).
+     */
+  void readNullspaceParams();
+
+  /**
+     * @brief Null-space-projected secondary joint velocity (first order)
+     *
+     * Implements the redundancy-resolution law ported from the
+     * ``inverse_kinematics_toolkit`` (ikt_core): a soft posture bias projected
+     * into the task null space so it can never disturb the Cartesian task.
+     *
+     *   \f$ v_0 = K_p W (q_{rest} - q) \f$
+     *   \f$ J^{+} = J^T (J J^T + \lambda^2 I_6)^{-1}, \quad N = I - J^{+} J \f$
+     *   returns \f$ \text{sat}(N v_0) \f$  (saturated to ``max_speed``)
+     *
+     * This is a FIRST-ORDER (velocity-level) term, matching the reference's
+     * ``dq_null = N * bias`` position step.  Callers add it to the commanded
+     * joint velocity/position each cycle but must NOT integrate it into the
+     * solver's persistent velocity state -- being re-derived from the measured
+     * configuration every cycle and carrying no momentum, it cannot accumulate
+     * or run away when the internal model and the real robot diverge (a
+     * second-order/acceleration form does exactly that on hardware).
+     *
+     * Returns a zero vector when ``solver.nullspace.enabled`` is false, i.e.
+     * exact stock behaviour.  ``readNullspaceParams()`` must have been called.
+     *
+     * @param jacobian The current 6xN end-effector Jacobian of the chain
+     * @return The null-space joint velocity contribution (length N)
+     */
+  ctrl::VectorND computeNullspaceJointVelocity(const KDL::Jacobian & jacobian);
+
   template <typename ParameterT>
   auto auto_declare(const std::string & name, const ParameterT & default_value)
   {
@@ -198,9 +244,21 @@ protected:
   KDL::JntArray m_last_positions;
   KDL::JntArray m_last_velocities;
 
+  //! Joint configuration captured at setStartState(); default null-space rest posture
+  KDL::JntArray m_start_positions;
+
   // Joint limits
   KDL::JntArray m_upper_pos_limits;
   KDL::JntArray m_lower_pos_limits;
+
+  // Null-space redundancy resolution (solver.nullspace.*), cached per cycle by
+  // readNullspaceParams() and consumed by computeNullspaceJointVelocity().
+  bool m_ns_enabled = false;
+  double m_ns_stiffness = 1.0;             ///< Kp: posture-centering rate [1/s]
+  double m_ns_max_speed = 0.05;            ///< saturation on ‖qdot_null‖ [rad/s]
+  double m_ns_pinv_lambda = 0.01;          ///< damped-pseudo-inverse lambda
+  std::vector<double> m_ns_rest_posture;   ///< target posture; empty -> m_start_positions
+  std::vector<double> m_ns_joint_weights;  ///< per-joint W; empty -> all ones
 
   // Forward kinematics
   std::shared_ptr<KDL::ChainFkSolverPos_recursive> m_fk_pos_solver;

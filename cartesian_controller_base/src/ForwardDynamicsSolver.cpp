@@ -107,7 +107,21 @@ trajectory_msgs::msg::JointTrajectoryPoint ForwardDynamicsSolver::getJointContro
   m_current_velocities.data =
     m_last_velocities.data + m_current_accelerations.data * period.seconds();
   m_current_velocities.data *= 0.9;
-  m_current_positions.data = m_last_positions.data + m_current_velocities.data * period.seconds();
+
+  // Redundancy resolution (7-DOF null-space constraint): a FIRST-ORDER posture
+  // bias projected into the Cartesian task null space, so the redundant DOF
+  // (e.g. the elbow swivel) is driven toward the rest posture without
+  // disturbing the end-effector task.  It is re-derived from the measured
+  // configuration every cycle and, crucially, is NOT integrated into the
+  // persistent velocity state (m_last_velocities below), so it carries no
+  // momentum and cannot accumulate / run away when the internal model and the
+  // real robot diverge.  No-op when solver.nullspace.enabled is false.
+  readNullspaceParams();
+  const ctrl::VectorND qdot_null = computeNullspaceJointVelocity(m_jnt_jacobian);
+
+  // Propagate the position with the task velocity PLUS the null-space bias.
+  m_current_positions.data =
+    m_last_positions.data + (m_current_velocities.data + qdot_null) * period.seconds();
 
   // Make sure positions stay in allowed margins
   applyJointLimits();
@@ -117,7 +131,7 @@ trajectory_msgs::msg::JointTrajectoryPoint ForwardDynamicsSolver::getJointContro
   for (int i = 0; i < m_number_joints; ++i)
   {
     control_cmd.positions.push_back(m_current_positions(i));
-    control_cmd.velocities.push_back(m_current_velocities(i));
+    control_cmd.velocities.push_back(m_current_velocities(i) + qdot_null(i));
 
     // Accelerations should be left empty. Those values will be interpreted
     // by most hardware joint drivers as max. tolerated values. As a
@@ -125,7 +139,8 @@ trajectory_msgs::msg::JointTrajectoryPoint ForwardDynamicsSolver::getJointContro
   }
   control_cmd.time_from_start = period;  // valid for this duration
 
-  // Update for the next cycle
+  // Update for the next cycle.  Persist the TASK velocity only -- the
+  // first-order null-space bias must not accumulate.
   m_last_positions = m_current_positions;
   m_last_velocities = m_current_velocities;
 
@@ -152,6 +167,10 @@ bool ForwardDynamicsSolver::init(std::shared_ptr<rclcpp_lifecycle::LifecycleNode
 
   // Set the initial value if provided at runtime, else use default value.
   m_min = auto_declare(m_params + ".link_mass", 0.1);
+
+  // Declare the shared null-space redundancy-resolution parameters
+  // (solver.nullspace.*).  Disabled by default -> stock behaviour unchanged.
+  declareNullspaceParams();
 
   RCLCPP_INFO(nh->get_logger(), "Forward dynamics solver initialized");
   RCLCPP_INFO(nh->get_logger(), "Forward dynamics solver has control over %i joints",

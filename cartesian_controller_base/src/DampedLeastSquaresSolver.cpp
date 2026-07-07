@@ -86,6 +86,18 @@ trajectory_msgs::msg::JointTrajectoryPoint DampedLeastSquaresSolver::getJointCon
       .inverse() *
     m_jnt_jacobian.data.transpose() * net_force;
 
+  // Redundancy resolution (7-DOF null-space constraint): add a first-order
+  // posture bias projected into the Cartesian task null space, so the redundant
+  // DOF (e.g. the elbow swivel) is driven toward the rest posture without
+  // disturbing the end-effector task.  Unlike the forward-dynamics solver this
+  // solver keeps NO persistent velocity (it re-solves from the measured
+  // configuration every cycle), so it does not integrate/accumulate error --
+  // combined with a high solver.iterations this behaves like an iterative
+  // position IK (converge each cycle) rather than a drifting dynamic chase.
+  // No-op when solver.nullspace.enabled is false.
+  readNullspaceParams();
+  m_current_velocities.data += computeNullspaceJointVelocity(m_jnt_jacobian);
+
   // Integrate once, starting with zero motion
   m_current_positions.data =
     m_last_positions.data + 0.5 * m_current_velocities.data * period.seconds();
@@ -123,6 +135,10 @@ bool DampedLeastSquaresSolver::init(std::shared_ptr<rclcpp_lifecycle::LifecycleN
   m_jnt_jacobian.resize(m_number_joints);
 
   auto_declare(m_params + ".alpha", 1.0);
+
+  // Declare the shared null-space redundancy-resolution parameters
+  // (solver.nullspace.*).  Disabled by default -> stock behaviour unchanged.
+  declareNullspaceParams();
 
   return true;
 }
