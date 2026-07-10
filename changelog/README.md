@@ -10,3 +10,4 @@ Each entry is a separate file, named `YYYY-MM-DD-<slug>.md`, sorted by date.
 ## Entries
 
 - [2026-05-21 — Live `robot_description` updates](2026-05-21-live-robot-description-updates.md)
+- [2026-07-10 — Live forward-dynamics link mass](2026-07-10-live-forward-dynamics-link-mass.md)

@@ -43,6 +43,7 @@
 #include <cartesian_controller_base/IKSolver.h>
 #include <cartesian_controller_base/Utility.h>
 
+#include <atomic>
 #include <kdl/chain.hpp>
 #include <kdl/chaindynparam.hpp>
 #include <kdl/chainfksolverpos_recursive.hpp>

@@ -401,11 +401,23 @@ rcl_interfaces::msg::SetParametersResult CartesianControllerBase::onParameterUpd
   rcl_interfaces::msg::SetParametersResult result;
   result.successful = true;
 
-  // We only care about robot_description here; other parameters (solver gains,
-  // hand_frame_control, etc.) flow through unchanged and pass the default
-  // accept.  The callback must, however, return for ALL set requests.
+  // Validate parameters that have hard safety constraints and rebuild the
+  // kinematic chain when robot_description changes. Other parameters flow
+  // through unchanged and are read live by their owning components.
   for (const auto & param : parameters)
   {
+    if (param.get_name() == "solver.forward_dynamics.link_mass")
+    {
+      if (param.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
+          !std::isfinite(param.as_double()) || param.as_double() <= 0.0)
+      {
+        result.successful = false;
+        result.reason =
+          "solver.forward_dynamics.link_mass must be a finite double greater than zero";
+        return result;
+      }
+      continue;
+    }
     if (param.get_name() != "robot_description")
     {
       continue;

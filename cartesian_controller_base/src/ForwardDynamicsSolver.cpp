@@ -40,6 +40,7 @@
 #include <cartesian_controller_base/ForwardDynamicsSolver.h>
 
 #include <algorithm>
+#include <cmath>
 #include <kdl/framevel.hpp>
 #include <kdl/jntarrayvel.hpp>
 #include <map>
@@ -77,6 +78,10 @@ ForwardDynamicsSolver::~ForwardDynamicsSolver() {}
 trajectory_msgs::msg::JointTrajectoryPoint ForwardDynamicsSolver::getJointControlCmds(
   rclcpp::Duration period, const ctrl::Vector6D & net_force)
 {
+  double link_mass = m_min.load();
+  m_handle->get_parameter(m_params + ".link_mass", link_mass);
+  m_min.store(link_mass);
+
   // Compute joint space inertia matrix with actualized link masses
   buildGenericModel();
   m_jnt_space_inertia_solver->JntToMass(m_current_positions, m_jnt_space_inertia);
@@ -166,7 +171,14 @@ bool ForwardDynamicsSolver::init(std::shared_ptr<rclcpp_lifecycle::LifecycleNode
   m_jnt_space_inertia.resize(m_number_joints);
 
   // Set the initial value if provided at runtime, else use default value.
-  m_min = auto_declare(m_params + ".link_mass", 0.1);
+  const double link_mass = auto_declare(m_params + ".link_mass", 0.1);
+  if (!std::isfinite(link_mass) || link_mass <= 0.0)
+  {
+    RCLCPP_ERROR(nh->get_logger(), "%s.link_mass must be finite and greater than zero",
+                 m_params.c_str());
+    return false;
+  }
+  m_min.store(link_mass);
 
   // Declare the shared null-space redundancy-resolution parameters
   // (solver.nullspace.*).  Disabled by default -> stock behaviour unchanged.
@@ -182,6 +194,7 @@ bool ForwardDynamicsSolver::init(std::shared_ptr<rclcpp_lifecycle::LifecycleNode
 bool ForwardDynamicsSolver::buildGenericModel()
 {
   // Set all masses and inertias to minimal (yet stable) values.
+  const double link_mass = m_min.load();
   double ip_min = 0.000001;
   for (size_t i = 0; i < m_chain.segments.size(); ++i)
   {
@@ -193,7 +206,7 @@ bool ForwardDynamicsSolver::buildGenericModel()
     else  // relatively moving segment
     {
       m_chain.segments[i].setInertia(
-        KDL::RigidBodyInertia(m_min,                          // mass
+        KDL::RigidBodyInertia(link_mass,                      // mass
                               KDL::Vector::Zero(),            // center of gravity
                               KDL::RotationalInertia(ip_min,  // ixx
                                                      ip_min,  // iyy

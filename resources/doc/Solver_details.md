@@ -60,6 +60,13 @@ The common solver has several parameters:
   ros2 topic list | grep current
   ```
 
+The `forward_dynamics` solver also provides
+`solver.forward_dynamics.link_mass` (default `0.1` kg). It sets the artificial
+mass of each moving non-tip chain segment; the final segment retains its unit
+mass and inertia. This fork reads the parameter before every virtual dynamics
+step, so positive finite values can be tuned live. Larger values generally make
+the response smoother and less aggressive, especially near singularities.
+
 All solver parameters can be set online via `dynamic_reconfigure` in the controllers'
 `solver` namespace, or at startup via the controller's `.yaml` configuration
 file, e.g. with

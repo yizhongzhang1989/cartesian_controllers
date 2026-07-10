@@ -112,3 +112,9 @@ this fork adds on top of upstream is:
   controllers from the controller_manager's immutable URDF, so auxiliary
   frames can be added by the `aux_frame_manager` (sole writer) without a
   custom bringup. Default false preserves stock behaviour.
+
+- **Live forward-dynamics virtual mass**
+  ([2026-07-10](changelog/2026-07-10-live-forward-dynamics-link-mass.md)) —
+  `solver.forward_dynamics.link_mass` is refreshed before every virtual
+  dynamics step and must remain finite and greater than zero. This makes the
+  dashboard control affect the running solver without reloading a controller.
