@@ -63,9 +63,15 @@ The common solver has several parameters:
 The `forward_dynamics` solver also provides
 `solver.forward_dynamics.link_mass` (default `0.1` kg). It sets the artificial
 mass of each moving non-tip chain segment; the final segment retains its unit
-mass and inertia. This fork reads the parameter before every virtual dynamics
+mass. This fork reads the parameter before every virtual dynamics
 step, so positive finite values can be tuned live. Larger values generally make
 the response smoother and less aggressive, especially near singularities.
+
+Its rotational counterpart is `solver.forward_dynamics.link_inertia`
+(default `1.0` kg·m²), the isotropic rotational inertia of the final
+(end-effector) segment. It is read live the same way; larger values make the
+simulated end-effector rotate more sluggishly under a given torque, exactly as
+`link_mass` slows translation.
 
 All solver parameters can be set online via `dynamic_reconfigure` in the controllers'
 `solver` namespace, or at startup via the controller's `.yaml` configuration

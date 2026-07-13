@@ -82,6 +82,10 @@ trajectory_msgs::msg::JointTrajectoryPoint ForwardDynamicsSolver::getJointContro
   m_handle->get_parameter(m_params + ".link_mass", link_mass);
   m_min.store(link_mass);
 
+  double link_inertia = m_link_inertia.load();
+  m_handle->get_parameter(m_params + ".link_inertia", link_inertia);
+  m_link_inertia.store(link_inertia);
+
   // Compute joint space inertia matrix with actualized link masses
   buildGenericModel();
   m_jnt_space_inertia_solver->JntToMass(m_current_positions, m_jnt_space_inertia);
@@ -180,6 +184,16 @@ bool ForwardDynamicsSolver::init(std::shared_ptr<rclcpp_lifecycle::LifecycleNode
   }
   m_min.store(link_mass);
 
+  // Rotational counterpart of link_mass: the virtual end-effector inertia.
+  const double link_inertia = auto_declare(m_params + ".link_inertia", 1.0);
+  if (!std::isfinite(link_inertia) || link_inertia <= 0.0)
+  {
+    RCLCPP_ERROR(nh->get_logger(), "%s.link_inertia must be finite and greater than zero",
+                 m_params.c_str());
+    return false;
+  }
+  m_link_inertia.store(link_inertia);
+
   // Declare the shared null-space redundancy-resolution parameters
   // (solver.nullspace.*).  Disabled by default -> stock behaviour unchanged.
   declareNullspaceParams();
@@ -218,8 +232,10 @@ bool ForwardDynamicsSolver::buildGenericModel()
 
   // Only give the last segment a generic mass and inertia.
   // See https://arxiv.org/pdf/1908.06252.pdf for a motivation for this setting.
+  // The rotational inertia is the tunable ``link_inertia`` (isotropic), the
+  // rotational counterpart of ``link_mass``; default 1.0 == historical value.
   double m = 1;
-  double ip = 1;
+  const double ip = m_link_inertia.load();
   m_chain.segments[m_chain.segments.size() - 1].setInertia(
     KDL::RigidBodyInertia(m, KDL::Vector::Zero(), KDL::RotationalInertia(ip, ip, ip)));
 

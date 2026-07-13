@@ -129,6 +129,16 @@ private:
      * behavior. Near singularities, a bigger value leads to smoother motion.
      */
   std::atomic<double> m_min = 0.1;
+
+  /**
+     * Virtual end-effector rotational inertia (isotropic, kg*m^2).
+     * The rotational counterpart of the virtual link mass: it sets the
+     * generic rotational inertia (ixx = iyy = izz) of the last (end-effector)
+     * link, so a bigger value makes the simulated end-effector rotate more
+     * sluggishly under a given torque -- exactly as link_mass slows down
+     * translation. Default 1.0 reproduces the historical hard-coded value.
+     */
+  std::atomic<double> m_link_inertia = 1.0;
 };
 
 }  // namespace cartesian_controller_base

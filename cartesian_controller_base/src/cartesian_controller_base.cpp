@@ -418,6 +418,18 @@ rcl_interfaces::msg::SetParametersResult CartesianControllerBase::onParameterUpd
       }
       continue;
     }
+    if (param.get_name() == "solver.forward_dynamics.link_inertia")
+    {
+      if (param.get_type() != rclcpp::ParameterType::PARAMETER_DOUBLE ||
+          !std::isfinite(param.as_double()) || param.as_double() <= 0.0)
+      {
+        result.successful = false;
+        result.reason =
+          "solver.forward_dynamics.link_inertia must be a finite double greater than zero";
+        return result;
+      }
+      continue;
+    }
     if (param.get_name() != "robot_description")
     {
       continue;
