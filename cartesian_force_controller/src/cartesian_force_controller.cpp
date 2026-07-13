@@ -152,15 +152,56 @@ controller_interface::return_type CartesianForceController::update(const rclcpp:
 ctrl::Vector6D CartesianForceController::computeForceError()
 {
   ctrl::Vector6D target_wrench;
-  m_hand_frame_control = get_node()->get_parameter("hand_frame_control").as_bool();
 
-  if (m_hand_frame_control)  // Assume end-effector frame by convention
+  // Honor the target wrench's ``header.frame_id`` when it names a link of the
+  // kinematic chain: the commanded force/torque is rotated from that link into
+  // the robot base frame, so callers can express the wrench in whichever frame
+  // they choose (e.g. base vs. tool) straight from the WrenchStamped, as ROS
+  // intends.  When the frame_id is empty (unspecified) or is not part of the
+  // chain, fall back to the legacy ``hand_frame_control`` flag (true =>
+  // end-effector frame, false => robot base frame) so existing setups are
+  // unaffected.
+  //
+  // NOTE: ``m_target_wrench_frame`` is written from the subscription callback
+  // and read here in the update() thread.  Robot link names are short and hit
+  // std::string SSO (no heap allocation), so the worst a data race can do is a
+  // one-cycle garbled name, which robotChainContains() then rejects (fall
+  // back) -- it never dereferences freed memory.  This matches the benign race
+  // already accepted for ``m_target_wrench`` itself.
+  const std::string frame = m_target_wrench_frame;
+
+  if (!frame.empty() && frame == Base::m_robot_base_link)
   {
-    target_wrench = Base::displayInBaseLink(m_target_wrench, Base::m_end_effector_link);
-  }
-  else  // Default to robot base frame
-  {
+    // Already expressed in the base frame -- use as-is (no rotation).
     target_wrench = m_target_wrench;
+  }
+  else if (!frame.empty() && Base::robotChainContains(frame))
+  {
+    // Rotate the wrench from the requested chain link into the base frame.
+    target_wrench = Base::displayInBaseLink(m_target_wrench, frame);
+  }
+  else
+  {
+    if (!frame.empty())
+    {
+      auto & clock = *get_node()->get_clock();
+      RCLCPP_WARN_STREAM_THROTTLE(
+        get_node()->get_logger(), clock, 3000,
+        "target_wrench frame_id '"
+          << frame << "' is neither the base link nor part of the kinematic chain from "
+          << Base::m_robot_base_link << " to " << Base::m_end_effector_link
+          << "; falling back to hand_frame_control");
+    }
+    m_hand_frame_control = get_node()->get_parameter("hand_frame_control").as_bool();
+
+    if (m_hand_frame_control)  // Assume end-effector frame by convention
+    {
+      target_wrench = Base::displayInBaseLink(m_target_wrench, Base::m_end_effector_link);
+    }
+    else  // Default to robot base frame
+    {
+      target_wrench = m_target_wrench;
+    }
   }
 
   // Superimpose target wrench and sensor wrench in base frame
@@ -250,6 +291,10 @@ void CartesianForceController::targetWrenchCallback(
   m_target_wrench[3] = wrench->wrench.torque.x;
   m_target_wrench[4] = wrench->wrench.torque.y;
   m_target_wrench[5] = wrench->wrench.torque.z;
+
+  // Remember the frame the wrench was expressed in so computeForceError() can
+  // rotate it into the base frame (honoring header.frame_id).
+  m_target_wrench_frame = wrench->header.frame_id;
 }
 
 void CartesianForceController::ftSensorWrenchCallback(

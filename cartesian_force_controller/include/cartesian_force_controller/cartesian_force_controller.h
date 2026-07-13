@@ -131,6 +131,16 @@ private:
      * intuitive for tele-manipulation.
      */
   bool m_hand_frame_control;
+
+  /**
+     * The ``header.frame_id`` of the most recently received target wrench.
+     * When it names a link of the kinematic chain, computeForceError() rotates
+     * the commanded wrench from that frame into the robot base frame (honoring
+     * the WrenchStamped frame_id, as ROS intends).  When it is empty or is not
+     * part of the chain, the legacy ``m_hand_frame_control`` behavior applies,
+     * so existing configurations are unaffected.
+     */
+  std::string m_target_wrench_frame;
 };
 
 }  // namespace cartesian_force_controller
