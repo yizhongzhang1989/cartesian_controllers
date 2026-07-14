@@ -15,11 +15,15 @@ add_definitions(-DEIGEN_MPL2_ONLY)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(cartesian_controller_base REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 
 # Convenience variable for dependencies
 set(THIS_PACKAGE_INCLUDE_DEPENDS
         rclcpp
         cartesian_controller_base
+        tf2
+        tf2_ros
         Eigen3
 )
 

@@ -39,6 +39,10 @@
 
 #include <cartesian_force_controller/cartesian_force_controller.h>
 
+#include <tf2/exceptions.h>
+#include <tf2/time.h>
+
+#include <Eigen/Geometry>
 #include <cmath>
 
 #include "cartesian_controller_base/Utility.h"
@@ -103,6 +107,17 @@ CartesianForceController::on_configure(const rclcpp_lifecycle::State & previous_
       get_node()->get_name() + std::string("/ft_sensor_wrench"), 10,
       std::bind(&CartesianForceController::ftSensorWrenchCallback, this, std::placeholders::_1));
 
+  // TF buffer/listener so a target wrench's header.frame_id may name ANY frame
+  // in the live TF tree (e.g. a shared base_link/world mount frame, or the
+  // other arm), not only links of this controller's own kinematic chain.  The
+  // buffer-only listener ctor spins its own thread, so wrench-frame resolution
+  // does not depend on this controller node being added to an external executor.
+  if (!m_tf_buffer)
+  {
+    m_tf_buffer = std::make_shared<tf2_ros::Buffer>(get_node()->get_clock());
+    m_tf_listener = std::make_shared<tf2_ros::TransformListener>(*m_tf_buffer);
+  }
+
   m_target_wrench.setZero();
   m_ft_sensor_wrench.setZero();
 
@@ -153,14 +168,18 @@ ctrl::Vector6D CartesianForceController::computeForceError()
 {
   ctrl::Vector6D target_wrench;
 
-  // Honor the target wrench's ``header.frame_id`` when it names a link of the
-  // kinematic chain: the commanded force/torque is rotated from that link into
-  // the robot base frame, so callers can express the wrench in whichever frame
-  // they choose (e.g. base vs. tool) straight from the WrenchStamped, as ROS
-  // intends.  When the frame_id is empty (unspecified) or is not part of the
-  // chain, fall back to the legacy ``hand_frame_control`` flag (true =>
-  // end-effector frame, false => robot base frame) so existing setups are
-  // unaffected.
+  // Honor the target wrench's ``header.frame_id`` so callers can express the
+  // commanded force/torque in whichever frame they choose (e.g. base vs. tool),
+  // straight from the WrenchStamped, as ROS intends.  Resolution order:
+  //   1. the robot base link           -> used as-is (no rotation),
+  //   2. a link of the kinematic chain -> rotated via the controller's own FK,
+  //   3. ANY other frame in the TF tree (e.g. a shared base_link/world mount
+  //      frame, or the other arm)      -> rotated via a live TF lookup.
+  // Only the reference frame's ORIENTATION is applied (the wrench stays applied
+  // at the end-effector), matching displayInBaseLink's convention.  When the
+  // frame_id is empty (unspecified) or cannot be resolved by any of the above,
+  // fall back to the legacy ``hand_frame_control`` flag (true => end-effector
+  // frame, false => robot base frame) so existing setups are unaffected.
   //
   // NOTE: ``m_target_wrench_frame`` is written from the subscription callback
   // and read here in the update() thread.  Robot link names are short and hit
@@ -177,8 +196,14 @@ ctrl::Vector6D CartesianForceController::computeForceError()
   }
   else if (!frame.empty() && Base::robotChainContains(frame))
   {
-    // Rotate the wrench from the requested chain link into the base frame.
+    // A link of this controller's own chain: rotate via the controller's FK
+    // (fast path, no TF dependency).
     target_wrench = Base::displayInBaseLink(m_target_wrench, frame);
+  }
+  else if (!frame.empty() && tryRotateWrenchFromTf(frame, m_target_wrench, target_wrench))
+  {
+    // Any other frame in the live TF tree (e.g. a shared base_link/world mount
+    // frame, or the other arm): rotated into the base frame by the helper.
   }
   else
   {
@@ -188,9 +213,9 @@ ctrl::Vector6D CartesianForceController::computeForceError()
       RCLCPP_WARN_STREAM_THROTTLE(
         get_node()->get_logger(), clock, 3000,
         "target_wrench frame_id '"
-          << frame << "' is neither the base link nor part of the kinematic chain from "
+          << frame << "' is neither the base link, a link of the kinematic chain from "
           << Base::m_robot_base_link << " to " << Base::m_end_effector_link
-          << "; falling back to hand_frame_control");
+          << ", nor resolvable via TF; falling back to hand_frame_control");
     }
     m_hand_frame_control = get_node()->get_parameter("hand_frame_control").as_bool();
 
@@ -206,6 +231,58 @@ ctrl::Vector6D CartesianForceController::computeForceError()
 
   // Superimpose target wrench and sensor wrench in base frame
   return Base::displayInBaseLink(m_ft_sensor_wrench, m_new_ft_sensor_ref) + target_wrench;
+}
+
+bool CartesianForceController::tryRotateWrenchFromTf(const std::string & frame,
+                                                     const ctrl::Vector6D & wrench_in_frame,
+                                                     ctrl::Vector6D & wrench_in_base)
+{
+  if (!m_tf_buffer)
+  {
+    return false;
+  }
+
+  ctrl::Matrix3D R_base_frame;
+  try
+  {
+    // Orientation of ``frame`` expressed in the robot base link.  TimePointZero
+    // = latest available transform; the wrench is a steady-state command, so
+    // exact time synchronization is unnecessary.
+    const geometry_msgs::msg::TransformStamped tf =
+      m_tf_buffer->lookupTransform(Base::m_robot_base_link, frame, tf2::TimePointZero);
+    const auto & q = tf.transform.rotation;
+    R_base_frame = Eigen::Quaterniond(q.w, q.x, q.y, q.z).normalized().toRotationMatrix();
+
+    // Cache for this frame so a transient lookup miss on a later cycle reuses
+    // the last good rotation instead of snapping back to the tool frame.
+    m_tf_rot_cache = R_base_frame;
+    m_tf_rot_cache_frame = frame;
+    m_tf_rot_cached = true;
+  }
+  catch (const tf2::TransformException & ex)
+  {
+    if (m_tf_rot_cached && m_tf_rot_cache_frame == frame)
+    {
+      R_base_frame = m_tf_rot_cache;  // reuse last good rotation for this frame
+    }
+    else
+    {
+      auto & clock = *get_node()->get_clock();
+      RCLCPP_WARN_STREAM_THROTTLE(get_node()->get_logger(), clock, 3000,
+                                  "target_wrench frame_id '"
+                                    << frame << "': TF lookup to '" << Base::m_robot_base_link
+                                    << "' failed (" << ex.what() << ")");
+      return false;
+    }
+  }
+
+  // Rotate force (linear, first 3) and torque (angular, last 3) into the base
+  // frame.  Only the orientation is applied -- consistent with
+  // displayInBaseLink's free-vector convention (the wrench stays applied at the
+  // end-effector; the frame_id selects the reference orientation).
+  wrench_in_base.head<3>() = R_base_frame * wrench_in_frame.head<3>();
+  wrench_in_base.tail<3>() = R_base_frame * wrench_in_frame.tail<3>();
+  return true;
 }
 
 void CartesianForceController::setFtSensorReferenceFrame(const std::string & new_ref)
